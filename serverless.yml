@@ -1,0 +1,118 @@
+service: serverless-demo
+
+provider:
+  name: aws
+  runtime: python3.8
+  memorySize: 128
+  region: eu-central-1
+  stage: ${opt:stage, 'dev'}
+  timeout: 60
+  stackTags:
+    APP: ${self:service}
+  deploymentBucket:
+    name: dcn.${self:provider.region}.${self:provider.stage}.serverless-deployment
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - dynamodb:*
+      Resource:
+        - !GetAtt DynamoDbTableItems.Arn
+    - Effect: Allow
+      Action:
+        - sqs:*
+      Resource:
+        - !GetAtt SqsStockUpdates.Arn
+    - Effect: Allow
+      Action:
+        - s3:GetObject
+      Resource:
+        - 'arn:aws:s3:::dcn-serverless-demo-stock/*'
+
+
+package:
+  exclude:
+    - ./**
+    - '!src/**/*.py'
+
+custom:
+  ## Beispiel fuer einen Stage spezifischen Wert aus einem Config-File
+  #keyId: ${file(config/config.${self:provider.stage}.yml):keyId}
+  
+functions:
+  # Bucket-Names müssen eindeutig sein. Wenn der Bucket schon vergeben ist, muss ein anderer gewählt werden. Zusätzlich muss das iamRoleStatement weiter oben entsprechend angepasst werden. Eine direkte Referenz ist wegen einem Zirkelbezug hier leider nicht möglich
+  uploadedStock:
+    handler: src/uploaded_stock_handler.on_s3_event
+    events:
+      - s3:
+          bucket: dcn-serverless-demo-stock
+          event: s3:ObjectCreated:*
+    environment:
+      STOCK_QUEUE_URL: !Ref SqsStockUpdates
+  processStockEntry:
+    handler: src/process_stock_entry_handler.on_sqs_event
+    events:
+      - sqs:
+          arn: !GetAtt SqsStockUpdates.Arn
+          batchSize: 1
+    timeout: 5
+    environment:
+      ITEM_TABLE: !Ref DynamoDbTableItems
+  getItemStock:
+    handler: src/get_stock_handler.on_get
+    events:
+      - httpApi:
+          method: GET
+          path: /items/{itemId}
+    environment:
+      ITEM_TABLE: !Ref DynamoDbTableItems
+
+resources:
+  Resources:
+    DynamoDbTableItems:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: itemId
+            AttributeType: S
+          - AttributeName: sortKey
+            AttributeType: S
+        KeySchema:
+          - AttributeName: itemId
+            KeyType: HASH
+          - AttributeName: sortKey
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+        SSESpecification:
+          SSEEnabled: true
+
+    SqsStockUpdates:
+      Type: AWS::SQS::Queue
+      Properties:
+        VisibilityTimeout: 5
+
+    # SNS-Topic und Alarm zur Überwachung einer Metrik. In diesem Fall die Error-Metric der Lambda getItemStock
+    # Alarms und Healings werden dann an via SNS-Topic an die Subscriber des Topics gepushed.
+    # Subscription z.B. als Email-Subscriber via Console
+    SnsAlarms:
+      Type: AWS::SNS::Topic
+
+    GetItemStocksErrorMonitoringAlert:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmActions:
+          - !Ref SnsAlarms
+        AlarmDescription: !Join [ '', [ 'Execution-Errors in Function ', !Ref GetItemStockLambdaFunction ] ]
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        DatapointsToAlarm: 1
+        EvaluationPeriods: 1
+        MetricName: Errors
+        Namespace: AWS/Lambda
+        Dimensions:
+          - Name: FunctionName
+            Value: !Ref GetItemStockLambdaFunction
+        OKActions:
+          - !Ref SnsAlarms
+        Period: 300
+        Statistic: Sum
+        Threshold: 1.0
+        TreatMissingData: notBreaching
